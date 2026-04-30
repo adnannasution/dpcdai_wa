@@ -1,10 +1,7 @@
 import os
 import re
-import json
 import threading
 import requests
-from datetime import datetime
-from difflib import SequenceMatcher
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 from langchain_community.utilities import SQLDatabase
@@ -22,78 +19,6 @@ PRISMA_HEADERS  = {"x-chatbot-key": CHATBOT_API_KEY}
 
 ALLOWED_NUMBERS_RAW = os.getenv("ALLOWED_NUMBERS", "")
 ALLOWED_NUMBERS = [n.strip() for n in ALLOWED_NUMBERS_RAW.split(",") if n.strip()]
-
-# ─── Q&A KNOWLEDGE STORE ─────────────────────────────────────────────────────
-QA_STORE_PATH = os.getenv("QA_STORE_PATH", "qa_store.json")
-
-def load_qa_store() -> list:
-    """Load Q&A store dari file JSON."""
-    if not os.path.exists(QA_STORE_PATH):
-        return []
-    try:
-        with open(QA_STORE_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return []
-
-def save_qa_store(store: list):
-    """Simpan Q&A store ke file JSON."""
-    try:
-        with open(QA_STORE_PATH, "w", encoding="utf-8") as f:
-            json.dump(store, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print(f"[QA STORE] Gagal simpan: {e}")
-
-def similarity(a: str, b: str) -> float:
-    """Hitung kemiripan dua string (0.0 - 1.0)."""
-    return SequenceMatcher(None, a.lower(), b.lower()).ratio()
-
-def find_similar_qa(question: str, store: list, threshold: float = 0.6) -> list:
-    """Cari Q&A yang mirip dari store, return top 3."""
-    scored = []
-    for entry in store:
-        score = similarity(question, entry.get("question", ""))
-        if score >= threshold:
-            scored.append((score, entry))
-    scored.sort(key=lambda x: x[0], reverse=True)
-    return [entry for _, entry in scored[:3]]
-
-def add_qa_to_store(question: str, sql: str, answer: str, source: str = "wa"):
-    """Tambah Q&A sukses ke store — auto deduplikasi."""
-    store = load_qa_store()
-    # Cek duplikat — kalau ada yang sangat mirip (>0.9), update saja
-    for entry in store:
-        if similarity(question, entry.get("question", "")) > 0.9:
-            entry["sql"]       = sql
-            entry["answer"]    = answer
-            entry["timestamp"] = datetime.now().isoformat()
-            entry["count"]     = entry.get("count", 1) + 1
-            save_qa_store(store)
-            print(f"[QA STORE] Updated existing entry: {question[:50]}")
-            return
-    # Baru — tambahkan
-    store.append({
-        "question":  question,
-        "sql":       sql,
-        "answer":    answer,
-        "source":    source,
-        "timestamp": datetime.now().isoformat(),
-        "count":     1,
-    })
-    save_qa_store(store)
-    print(f"[QA STORE] Saved new Q&A: {question[:50]}")
-
-def build_qa_context(similar_qas: list) -> str:
-    """Bangun string konteks dari Q&A serupa untuk di-inject ke prompt."""
-    if not similar_qas:
-        return ""
-    lines = ["\n\nREFERENSI Q&A SERUPA YANG PERNAH BERHASIL (gunakan sebagai panduan SQL):"]
-    for i, qa in enumerate(similar_qas, 1):
-        lines.append(f"Contoh {i}:")
-        lines.append(f"  Pertanyaan: {qa['question']}")
-        lines.append(f"  SQL yang benar: {qa['sql']}")
-        lines.append(f"  Jawaban: {qa['answer'][:200]}")
-    return "\n".join(lines)
 
 # ─── 2. SETUP AI ENGINE ───────────────────────────────────────────────────────
 db_engine = SQLDatabase.from_uri(DATABASE_URL, sample_rows_in_table_info=0)
@@ -231,12 +156,12 @@ ATURAN QUERY SQL:
 - Untuk anggaran_maintenance: kolom ru, tahun, kategori, tipe, nilai_usd (USD). Selalu tampilkan nilai_usd dengan format USD dan pemisah ribuan, contoh: 1,234,567.89 USD.
 - Untuk rcps_rekomendasi: rekomendasi dari RCPS — kolom kilang, rcps_no, judul_rcps, rekomendasi, traffic, pic, target, remark.
 - Untuk rcps: daftar RCPS — kolom kilang, traffic, sum_of_progress, disiplin, judul_rcps, rcps_no, criticallity.
-- Untuk boc: Basis of Comparison equipment — kolom ru, area, unit, equipment, status, frequency, running_hours, mttr, mtbf, hasil.
-- Untuk readiness_jetty: kesiapan operasional jetty — kolom refinery_unit, tag_no, status_operation, status_tuks, expired_tuks, status_ijin_ops, status_isps, status_struktur, status_trestle, status_mla, status_fire_protection, month_update.
+- Untuk boc: Basis Operation Care equipment — kolom ru, area, unit, equipment, status, frequency, running_hours, mttr, mtbf, hasil.
+- Untuk readiness_jetty: kesiapan atau readiness operasional jetty — kolom refinery_unit, tag_no, status_operation, status_tuks, expired_tuks, status_ijin_ops, status_isps, status_struktur, status_trestle, status_mla, status_fire_protection, month_update.
 - Untuk workplan_jetty: workplan perbaikan item jetty — kolom refinery_unit, tag_no, item, status_item, remark, rtl_action_plan, target, status_rtl, month_update.
-- Untuk readiness_tank: kesiapan operasional tangki — kolom refinery_unit, tag_number, type_tangki, service_tangki, prioritas, status_operational, atg_certification_validity, status_coi, status_atg, status_grounding, status_shell_course, status_roof, status_cathodic, month_update.
+- Untuk readiness_tank: kesiapan atau readiness operasional tangki — kolom refinery_unit, tag_number, type_tangki, service_tangki, prioritas, status_operational, atg_certification_validity, status_coi, status_atg, status_grounding, status_shell_course, status_roof, status_cathodic, month_update.
 - Untuk workplan_tank: workplan perbaikan tangki — kolom unit, tag_no, item, remark, rtl_action_plan, target, status_rtl, month_update.
-- Untuk readiness_spm: kesiapan operasional SPM — kolom refinery_unit, tag_no, status_operation, status_laik_operasi, expired_laik_operasi, status_ijin_spl, status_mbc, status_lds, status_mooring_hawser, status_floating_hose, status_cathodic_spl, month_update.
+- Untuk readiness_spm: kesiapan atau readiness operasional SPM — kolom refinery_unit, tag_no, status_operation, status_laik_operasi, expired_laik_operasi, status_ijin_spl, status_mbc, status_lds, status_mooring_hawser, status_floating_hose, status_cathodic_spl, month_update.
 - Untuk spm_workplan: workplan perbaikan SPM — kolom refinery_unit, tag_no, item, remark, rtl_action_plan, target, status_rtl, month_update.
 - Untuk irkap_program: daftar program kerja IRKAP 2024. KOLOM YANG TERSEDIA (gunakan HANYA nama kolom ini, jangan tambah kolom lain): refinery_unit, disiplin, kategori_rkap, material_jasa, highlevel_planning_note, referensi_prokja_sebelumnya, no_program_kerja, equipment_tag_no, type_equipment, detail_type_equipment, program_kerja, step_plan_today, detail_step_plan_today, step_actual_today, detail_step_actual_today, status_step, start_plan, finish_plan, status_prognosa, kelompok_biaya, nilai_anggaran_idr, nilai_anggaran_usd, top_risk, asset_integrity. TIDAK ADA kolom month_update, bulan, tahun, atau year di tabel ini — jangan generate kolom tersebut. Untuk filter tahun gunakan EXTRACT(YEAR FROM start_plan::DATE). Tampilkan nilai_anggaran_idr dengan format Rp.
 - Untuk irkap_actual: realisasi step pelaksanaan IRKAP. KOLOM YANG TERSEDIA (gunakan HANYA nama kolom ini): no, no_program, kategori_rkap, program_asset_integrity, refinery_unit, area, unit_process, tag_no, dasar_pengusulan, rekomendasi, program_kerja, disiplin, kategory_trigger, kelompok_sasaran_rk, kel_biaya, note, release_type, jadwal_pelaksanaan, jadwal_cost, jadwal_cash, strategy_penyelesaian, failure_impact, high_level_planning_note, referensi_prokja_sebelumnya, cost_center, cost_element, wbs_number, anggaran_idr, anggaran_usd, anggaran_equivalent_idr, probability_class, probability_likelyhood, economic_usd, health_safety, environment, ram_criticality, material_jasa, sumber_harga, actual_start1, actual_finish1, comp1, notif_no, actual_start2, actual_finish2, comp2, actual_start3, actual_finish3, comp3, wo_no, actual_start4, actual_finish4, comp4, ro_no, actual_start5, actual_finish5, comp5, actual_start6, actual_finish6, comp6, pr, actual_start7, actual_finish7, comp7, rfq, actual_start8, actual_finish8, comp8, po, actual_start9, actual_finish9, comp9, gr_no, actual_start10, actual_finish10, comp10, gi_no, actual_start11, actual_finish11, comp11, actual_start12, actual_finish12, comp12, actual_start13, actual_finish13, comp13, sa_no, actual_start14, actual_finish14, comp14, actual_start15, actual_finish15, comp15, current_step, status_step, status_prognosa. TIDAK ADA kolom month_update, bulan, tahun di tabel ini. Gunakan status_prognosa ('On Fiscal Year', 'Next Year', 'Closed') dan current_step untuk analisis progres.
@@ -295,15 +220,6 @@ def run_wa(question: str, sender: str) -> str:
         elif isinstance(msg, AIMessage):
             messages.append({"role": "assistant", "content": msg.content})
 
-    # ── Inject Q&A referensi dari store ──
-    qa_store      = load_qa_store()
-    similar_qas   = find_similar_qa(question, qa_store)
-    qa_context    = build_qa_context(similar_qas)
-    if qa_context:
-        # Sisipkan sebagai system message tambahan setelah prompt utama
-        messages.insert(1, {"role": "system", "content": qa_context})
-        print(f"[QA STORE] Injected {len(similar_qas)} similar Q&A as context")
-
     # ── Cek awal: Python keyword shortcut — bypass LLM untuk keyword yang pasti SPESIFIK ──
     _q_lower = question.lower()
     _SPESIFIK_KEYWORDS = [
@@ -314,8 +230,9 @@ def run_wa(question: str, sender: str) -> str:
         "inspection plan", "monitoring operasi",
         "irkap", "inspection", "prokja",
         "reservasi", "turnaround",
-        # ✅ Tambahan bahasa Indonesia:
-        "inspeksi", "realisasi", "bandingkan", "dibanding",
+        # ✅ Fix 1: Tambahan kata kunci bahasa Indonesia & kata follow-up
+        "inspeksi", "realisasi", "bandingkan", "dibanding", "dibandingkan",
+        "program kerja", "rencana inspeksi", "anggaran maintenance",
     ]
     _SAPAAN_KEYWORDS = [
         "halo", "hai", "hello", "hi ", "selamat pagi", "selamat siang",
@@ -327,10 +244,19 @@ def run_wa(question: str, sender: str) -> str:
     elif any(kw in _q_lower for kw in _SPESIFIK_KEYWORDS):
         intent = "SPESIFIK"
     else:
-        # Fallback ke LLM hanya jika keyword shortcut tidak match
+        # ✅ Fix 2: Sertakan history ke intent classifier agar bisa baca konteks follow-up
+        history_context = ""
+        if history:
+            last_msgs = history[-4:]
+            history_context = "\n".join([
+                f"{'User' if isinstance(m, HumanMessage) else 'Bot'}: {m.content[:200]}"
+                for m in last_msgs
+            ])
+
         intent_check = llm.invoke([{
             "role": "user",
             "content": (
+                f"Konteks percakapan sebelumnya:\n{history_context}\n\n"
                 f"Klasifikasikan pertanyaan berikut ke salah satu kategori:\n"
                 f"1. SAPAAN — jika sapaan, terima kasih, tanya kemampuan AI, atau obrolan umum yang tidak butuh data\n"
                 f"2. SPESIFIK — jika menyebut nama tabel/data berikut secara eksplisit: "
@@ -342,7 +268,10 @@ def run_wa(question: str, sender: str) -> str:
                 f"CATATAN: Kata 'ru', 'refinery unit', 'kilang', 'equipment', 'laporan', 'data', "
                 f"'status', 'berapa', 'jumlah', 'tampilkan' BUKAN nama tabel — jika hanya menyebut "
                 f"kata-kata itu tanpa nama tabel spesifik maka AMBIGU.\n"
-                f"Jawab hanya satu kata: SAPAAN, SPESIFIK, atau AMBIGU\n\nPertanyaan: {{question}}"
+                f"PENTING: Jika pertanyaan adalah follow-up (pakai kata seperti 'bandingkan', "
+                f"'realisasi', 'tersebut', 'itu', 'lanjut', 'vs') dan konteks sebelumnya sudah "
+                f"menyebut topik spesifik → klasifikasi SPESIFIK.\n"
+                f"Jawab hanya satu kata: SAPAAN, SPESIFIK, atau AMBIGU\n\nPertanyaan: {question}"
             )
         }])
         intent = intent_check.content.strip().upper()
@@ -352,13 +281,24 @@ def run_wa(question: str, sender: str) -> str:
         return greeting_response.content
 
     if "AMBIGU" in intent:
+        # ✅ Fix 3: Konfirmasi dinamis — LLM analisis apa yang kurang lalu tanya yang relevan
+        history_context = ""
+        if history:
+            last_msgs = history[-4:]
+            history_context = "\n".join([
+                f"{'User' if isinstance(m, HumanMessage) else 'Bot'}: {m.content[:200]}"
+                for m in last_msgs
+            ])
         clarify = llm.invoke([{
             "role": "user",
             "content": (
-                f"Riwayat: {history_context}\n"
-                f"Pertanyaan: {question}\n"
-                f"Tanya balik dalam 1 kalimat pendek: apa info yang kurang "
-                f"(RU? tahun? nama laporan?). Bahasa Indonesia, ramah, singkat."
+                f"Riwayat percakapan:\n{history_context}\n\n"
+                f"Pertanyaan user: {question}\n\n"
+                f"Pertanyaan ini kurang lengkap untuk query database kilang. "
+                f"Identifikasi informasi apa yang kurang (nama laporan, RU, tahun, filter, dll) "
+                f"lalu buat satu kalimat tanya yang natural dan relevan dalam Bahasa Indonesia. "
+                f"Jangan listing semua laporan yang ada, cukup tanyakan yang kurang saja. "
+                f"Format WhatsApp, singkat dan ramah."
             )
         }])
         return clarify.content.strip()
@@ -472,12 +412,8 @@ def run_wa(question: str, sender: str) -> str:
 
         try:
             db_result = db_engine.run(sql_query)
-            _local_sql_ok     = True
-            _local_sql_query  = sql_query
         except Exception as e:
-            db_result         = f"Query error: {str(e)}"
-            _local_sql_ok     = False
-            _local_sql_query  = sql_query
+            db_result = f"Query error: {str(e)}"
 
     # Generate jawaban final — format WhatsApp
     answer_messages = messages + [
@@ -496,22 +432,6 @@ def run_wa(question: str, sender: str) -> str:
     answer = re.sub(r'<table.*?>.*?</table>', '', answer, flags=re.DOTALL)
     answer = re.sub(r'<[^>]+>', '', answer)
     answer = re.sub(r'\[DOWNLOAD:\w+\]', '', answer).strip()
-
-    # ── Auto-save Q&A sukses ke store ──
-    # Hanya simpan jika: jalur LOCAL, SQL berhasil, jawaban tidak error/kosong
-    _is_error_answer = any(x in answer.lower() for x in [
-        "query error", "tidak bisa", "maaf", "gagal", "error", "belum tersedia"
-    ])
-    if (not is_prisma
-            and locals().get("_local_sql_ok", False)
-            and answer
-            and not _is_error_answer):
-        add_qa_to_store(
-            question = question,
-            sql      = locals().get("_local_sql_query", ""),
-            answer   = answer,
-            source   = "wa",
-        )
 
     # Simpan ke history
     add_history(sender, question, answer)
