@@ -314,6 +314,8 @@ def run_wa(question: str, sender: str) -> str:
         "inspection plan", "monitoring operasi",
         "irkap", "inspection", "prokja",
         "reservasi", "turnaround",
+        # ✅ Tambahan bahasa Indonesia:
+        "inspeksi", "realisasi", "bandingkan", "dibanding",
     ]
     _SAPAAN_KEYWORDS = [
         "halo", "hai", "hello", "hi ", "selamat pagi", "selamat siang",
@@ -350,7 +352,16 @@ def run_wa(question: str, sender: str) -> str:
         return greeting_response.content
 
     if "AMBIGU" in intent:
-        return "Laporan apa yang kamu maksud? 😊 Misalnya: Pipeline, ATG, Metering, Rotor, ICU, Bad Actor, BOC, Anggaran, IRKAP, atau yang lain?"
+        clarify = llm.invoke([{
+            "role": "user",
+            "content": (
+                f"Riwayat: {history_context}\n"
+                f"Pertanyaan: {question}\n"
+                f"Tanya balik dalam 1 kalimat pendek: apa info yang kurang "
+                f"(RU? tahun? nama laporan?). Bahasa Indonesia, ramah, singkat."
+            )
+        }])
+        return clarify.content.strip()
 
     # ── Cek PRISMA via LLM ──
     prisma_table_list = ", ".join(PRISMA_TABLES) if PRISMA_TABLES else "taex_reservasi, prisma_reservasi, kumpulan_summary, sap_pr, sap_po, work_order"
