@@ -6,6 +6,7 @@ from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 from langchain_community.utilities import SQLDatabase
 from langchain_openai import ChatOpenAI
+# OpenRouter menggunakan OpenAI-compatible API
 from langchain_core.messages import HumanMessage, AIMessage
 
 # ─── 1. LOAD CONFIGURATION ────────────────────────────────────────────────────
@@ -23,11 +24,17 @@ ALLOWED_NUMBERS = [n.strip() for n in ALLOWED_NUMBERS_RAW.split(",") if n.strip(
 # ─── 2. SETUP AI ENGINE ───────────────────────────────────────────────────────
 db_engine = SQLDatabase.from_uri(DATABASE_URL, sample_rows_in_table_info=0)
 
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+
 llm = ChatOpenAI(
-    model="gpt-4o",
-    openai_api_key=DINOIKI_API_KEY,
-    base_url="https://ai.dinoiki.com/v1",
+    model="google/gemma-4-31b-it",
+    openai_api_key=OPENROUTER_API_KEY,
+    base_url="https://openrouter.ai/api/v1",
     temperature=0.7,
+    default_headers={
+        "HTTP-Referer": "https://github.com/wa-bot",
+        "X-Title": "WA Bot Kilang",
+    },
 )
 
 # ─── 3. PRISMA INTEGRATION ────────────────────────────────────────────────────
