@@ -580,19 +580,27 @@ def run_wa(question: str, sender: str) -> str:
                     f"Error: {err}."
                 )
     else:
-        # ── LOCAL PATH ──
-        sql_messages = messages + [{"role": "user", "content": (
-            f"Berikan HANYA query SQL PostgreSQL yang valid untuk: {question}. "
-            f"Tanpa penjelasan, tanpa markdown."
-        )}]
-        sql_response = llm.invoke(sql_messages)
-        sql_query    = sql_response.content.replace("```sql", "").replace("```", "").strip()
-        print(f"[LOCAL SQL] {sql_query}")
+        # ── CEK GRAPH PATH dulu sebelum LOCAL SQL ──
+        is_graph = any(kw in _q_lower for kw in _GRAPH_KEYWORDS)
 
-        try:
-            db_result = db_engine.run(sql_query)
-        except Exception as e:
-            db_result = f"Query error: {str(e)}"
+        if is_graph:
+            # ── GRAPH PATH: query ke Neo4j ──
+            print(f"[GRAPH PATH] Routing ke Neo4j: {question}")
+            db_result = query_graph(question)
+        else:
+            # ── LOCAL PATH: query ke PostgreSQL ──
+            sql_messages = messages + [{"role": "user", "content": (
+                f"Berikan HANYA query SQL PostgreSQL yang valid untuk: {question}. "
+                f"Tanpa penjelasan, tanpa markdown."
+            )}]
+            sql_response = llm.invoke(sql_messages)
+            sql_query    = sql_response.content.replace("```sql", "").replace("```", "").strip()
+            print(f"[LOCAL SQL] {sql_query}")
+
+            try:
+                db_result = db_engine.run(sql_query)
+            except Exception as e:
+                db_result = f"Query error: {str(e)}"
 
     # Generate jawaban final — format WhatsApp
     answer_messages = messages + [
@@ -626,6 +634,88 @@ def send_wa(target: str, message: str) -> dict:
         timeout=30,
     )
     return response.json()
+
+# ─── 8a. QUERY KNOWLEDGE GRAPH ────────────────────────────────────────────────
+GRAPH_SCHEMA_PROMPT = """
+Knowledge Graph Neo4j tersedia dengan schema berikut:
+
+NODE: Equipment — data dari master_data_equipment
+  properties: equipment, criticality (A/B/C/Z), functional_location,
+              maintenance_plant, location, cost_center, equipment_category,
+              description, manufacturer, model_type, technical_obj_type,
+              material, material_description, size_dimension, sort_field_ata
+
+NODE: BOC — data performa & redundansi equipment
+  properties: equipment, ru, area, unit, grup_equipment, status,
+              frequency, running_hours, mttr, mtbf,
+              hasil (N+0/N+1/N+2/Single),
+              redundancy_status:
+                N+0    = "Tidak ada standby - KRITIS"
+                N+1    = "Ada 1 equipment standby"
+                N+2    = "Ada 2 equipment standby"
+                Single = "Equipment tunggal tanpa grup"
+
+RELATIONSHIP: (Equipment)-[:PUNYA_PERFORMA]->(BOC)
+
+CONTOH QUERY CYPHER:
+-- Equipment critical tanpa standby:
+MATCH (e:Equipment)-[:PUNYA_PERFORMA]->(b:BOC)
+WHERE e.criticality = 'A' AND b.hasil = 'N+0'
+RETURN e.equipment, e.description, b.area, b.redundancy_status
+
+-- Equipment dengan MTBF terendah:
+MATCH (e:Equipment)-[:PUNYA_PERFORMA]->(b:BOC)
+WHERE b.mtbf > 0
+RETURN e.equipment, e.description, b.mtbf ORDER BY b.mtbf ASC LIMIT 10
+
+-- Jumlah equipment per hasil redundansi:
+MATCH (b:BOC)
+RETURN b.hasil, count(b) AS jumlah ORDER BY jumlah DESC
+"""
+
+def query_graph(question: str) -> str:
+    """Generate Cypher dari pertanyaan lalu query Neo4j."""
+    try:
+        # Step 1: LLM generate Cypher
+        cypher_prompt = (
+            f"{GRAPH_SCHEMA_PROMPT}\n\n"
+            f"Buat Cypher query Neo4j untuk pertanyaan berikut.\n"
+            f"ATURAN:\n"
+            f"- Hanya output Cypher murni, tanpa penjelasan, tanpa markdown\n"
+            f"- Selalu LIMIT 20 kecuali agregasi\n"
+            f"- Gunakan CONTAINS atau STARTS WITH untuk pencarian teks\n\n"
+            f"Pertanyaan: {question}"
+        )
+        cypher_resp = llm.invoke([{"role": "user", "content": cypher_prompt}])
+        cypher = cypher_resp.content.replace("```cypher", "").replace("```", "").strip()
+        print(f"[GRAPH QUERY] Cypher: {cypher}")
+
+        # Step 2: Jalankan di Neo4j
+        neo = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASS))
+        with neo.session() as session:
+            result = session.run(cypher)
+            rows = [dict(r) for r in result]
+        neo.close()
+
+        if not rows:
+            return "Tidak ada data ditemukan di knowledge graph."
+
+        return f"Hasil graph ({len(rows)} data):\n{rows}"
+
+    except Exception as e:
+        print(f"[GRAPH QUERY ERROR] {e}")
+        return f"Query graph gagal: {str(e)}"
+
+
+# Keyword yang menandakan pertanyaan relasional → arahkan ke Neo4j
+_GRAPH_KEYWORDS = [
+    "paling sering", "pola", "riwayat", "hubungan", "relasi",
+    "n+0", "n+1", "n+2", "single", "standby", "redundan",
+    "mtbf", "mttr", "running hours", "grup equipment",
+    "tidak ada standby", "kritis tanpa standby",
+    "equipment mana yang", "equipment apa yang",
+    "perbandingan equipment", "analisis equipment",
+]
 
 # ─── 8b. KNOWLEDGE GRAPH SYNC ─────────────────────────────────────────────────
 def run_graph_sync():
