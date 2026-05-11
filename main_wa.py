@@ -3,8 +3,11 @@ import re
 import threading
 import requests
 import json
+import schedule
+import time
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
+from neo4j import GraphDatabase
 from langchain_community.utilities import SQLDatabase
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, AIMessage
@@ -18,6 +21,11 @@ FONNTE_TOKEN    = os.getenv("FONNTE_TOKEN")
 PRISMA_URL      = os.getenv("PRISMA_URL", "")
 CHATBOT_API_KEY = os.getenv("CHATBOT_API_KEY", "")
 PRISMA_HEADERS  = {"x-chatbot-key": CHATBOT_API_KEY}
+
+# ─── NEO4J CONFIG ─────────────────────────────────────────────────────────────
+NEO4J_URI  = os.getenv("NEO4J_URI", "bolt://viaduct.proxy.rlwy.net:22569")
+NEO4J_USER = os.getenv("NEO4J_USERNAME", "neo4j")
+NEO4J_PASS = os.getenv("NEO4J_PASSWORD", "Neo4j@2024")
 
 ALLOWED_NUMBERS_RAW = os.getenv("ALLOWED_NUMBERS", "")
 ALLOWED_NUMBERS = [n.strip() for n in ALLOWED_NUMBERS_RAW.split(",") if n.strip()]
@@ -619,6 +627,163 @@ def send_wa(target: str, message: str) -> dict:
     )
     return response.json()
 
+# ─── 8b. KNOWLEDGE GRAPH SYNC ─────────────────────────────────────────────────
+def run_graph_sync():
+    """
+    Sync master_data_equipment + boc ke Neo4j Knowledge Graph.
+    - Otomatis tiap tengah malam via scheduler
+    - Manual via endpoint /sync/graph?key=xxx
+
+    Kolom hasil di BOC:
+    - N+0    = tidak ada equipment standby dalam grup (KRITIS!)
+    - N+1    = ada 1 equipment standby
+    - N+2    = ada 2 equipment standby
+    - Single = equipment tidak punya grup, berdiri sendiri
+    """
+    import psycopg2
+    print("[GRAPH SYNC] Mulai sync knowledge graph...")
+    try:
+        pg  = psycopg2.connect(DATABASE_URL)
+        neo = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASS))
+
+        # Buat index supaya query cepat
+        with neo.session() as session:
+            session.run("CREATE INDEX eq_id  IF NOT EXISTS FOR (e:Equipment) ON (e.equipment)")
+            session.run("CREATE INDEX boc_id IF NOT EXISTS FOR (b:BOC) ON (b.equipment)")
+
+        # ── Sync master_data_equipment ─────────────────────────────────────
+        cur = pg.cursor("eq_cur")
+        cur.execute("""
+            SELECT equipment, criticality, functional_location,
+                   maintenance_plant, location, cost_center,
+                   equipment_category, description, manufacturer,
+                   model_type, technical_obj_type, material,
+                   material_description, size_dimension, sort_field_ata
+            FROM master_data_equipment
+            WHERE equipment IS NOT NULL
+        """)
+        total_eq = 0
+        while True:
+            rows = cur.fetchmany(1000)
+            if not rows:
+                break
+            with neo.session() as session:
+                session.run("""
+                    UNWIND $rows AS r
+                    MERGE (e:Equipment {equipment: r.equipment})
+                    SET e.criticality          = r.criticality,
+                        e.functional_location  = r.functional_location,
+                        e.maintenance_plant    = r.maintenance_plant,
+                        e.location             = r.location,
+                        e.cost_center          = r.cost_center,
+                        e.equipment_category   = r.equipment_category,
+                        e.description          = r.description,
+                        e.manufacturer         = r.manufacturer,
+                        e.model_type           = r.model_type,
+                        e.technical_obj_type   = r.technical_obj_type,
+                        e.material             = r.material,
+                        e.material_description = r.material_description,
+                        e.size_dimension       = r.size_dimension,
+                        e.sort_field_ata       = r.sort_field_ata
+                """, rows=[{
+                    "equipment":           r[0] or "",
+                    "criticality":         r[1] or "",
+                    "functional_location": r[2] or "",
+                    "maintenance_plant":   r[3] or "",
+                    "location":            r[4] or "",
+                    "cost_center":         r[5] or "",
+                    "equipment_category":  r[6] or "",
+                    "description":         r[7] or "",
+                    "manufacturer":        r[8] or "",
+                    "model_type":          r[9] or "",
+                    "technical_obj_type":  r[10] or "",
+                    "material":            r[11] or "",
+                    "material_description":r[12] or "",
+                    "size_dimension":      r[13] or "",
+                    "sort_field_ata":      r[14] or ""
+                } for r in rows])
+            total_eq += len(rows)
+            print(f"[GRAPH SYNC] Equipment: {total_eq} node...", end="\r")
+        cur.close()
+        print(f"\n[GRAPH SYNC] ✅ Equipment selesai: {total_eq} node")
+
+        # ── Sync BOC ───────────────────────────────────────────────────────
+        cur2 = pg.cursor("boc_cur")
+        cur2.execute("""
+            SELECT equipment, ru, area, unit, grup_equipment,
+                   status, frequency, running_hours, mttr, mtbf, hasil
+            FROM boc
+            WHERE equipment IS NOT NULL
+        """)
+        total_boc = 0
+        while True:
+            rows = cur2.fetchmany(1000)
+            if not rows:
+                break
+            with neo.session() as session:
+                session.run("""
+                    UNWIND $rows AS r
+                    MERGE (e:Equipment {equipment: r.equipment})
+                    MERGE (b:BOC {equipment: r.equipment})
+                    SET b.ru               = r.ru,
+                        b.area             = r.area,
+                        b.unit             = r.unit,
+                        b.grup_equipment   = r.grup_equipment,
+                        b.status           = r.status,
+                        b.frequency        = r.frequency,
+                        b.running_hours    = r.running_hours,
+                        b.mttr             = r.mttr,
+                        b.mtbf             = r.mtbf,
+                        b.hasil            = r.hasil,
+                        b.redundancy_status = r.redundancy_status
+                    MERGE (e)-[:PUNYA_PERFORMA]->(b)
+                """, rows=[{
+                    "equipment":      r[0] or "",
+                    "ru":             r[1] or "",
+                    "area":           r[2] or "",
+                    "unit":           r[3] or "",
+                    "grup_equipment": r[4] or "",
+                    "status":         r[5] or "",
+                    "frequency":      r[6] or 0,
+                    "running_hours":  float(r[7]) if r[7] else 0.0,
+                    "mttr":           float(r[8]) if r[8] else 0.0,
+                    "mtbf":           float(r[9]) if r[9] else 0.0,
+                    "hasil":          r[10] or "",
+                    "redundancy_status": (
+                        "Tidak ada standby - KRITIS"  if r[10] == "N+0"    else
+                        "Ada 1 equipment standby"      if r[10] == "N+1"    else
+                        "Ada 2 equipment standby"      if r[10] == "N+2"    else
+                        "Equipment tunggal tanpa grup" if r[10] == "Single" else
+                        r[10] or ""
+                    )
+                } for r in rows])
+            total_boc += len(rows)
+            print(f"[GRAPH SYNC] BOC: {total_boc} relasi...", end="\r")
+        cur2.close()
+        print(f"\n[GRAPH SYNC] ✅ BOC selesai: {total_boc} relasi")
+
+        neo.close()
+        pg.close()
+        print("[GRAPH SYNC] 🎉 Knowledge graph berhasil diperbarui!")
+        return {"ok": True, "equipment": total_eq, "boc": total_boc}
+
+    except Exception as e:
+        print(f"[GRAPH SYNC ERROR] {e}")
+        return {"ok": False, "error": str(e)}
+
+
+def _start_graph_scheduler():
+    """Scheduler otomatis sync graph tiap tengah malam."""
+    schedule.every().day.at("00:00").do(run_graph_sync)
+    print("[SCHEDULER] Graph sync dijadwalkan tiap tengah malam ✅")
+    while True:
+        schedule.run_pending()
+        time.sleep(60)
+
+# Jalankan scheduler di background saat app start
+threading.Thread(target=_start_graph_scheduler, daemon=True).start()
+
+
 # ─── 9. FLASK APP ─────────────────────────────────────────────────────────────
 app = Flask(__name__)
 
@@ -697,6 +862,16 @@ def webhook():
 
     threading.Thread(target=process, daemon=True).start()
     return jsonify({"status": "ok"}), 200
+
+@app.route("/sync/graph", methods=["GET"])
+def sync_graph_endpoint():
+    """Trigger sync manual via browser atau Postman."""
+    key = request.args.get("key", "")
+    if key != CHATBOT_API_KEY:
+        return jsonify({"error": "Unauthorized"}), 401
+    threading.Thread(target=run_graph_sync, daemon=True).start()
+    return jsonify({"status": "Sync graph dimulai di background!"}), 200
+
 
 @app.route("/", methods=["GET"])
 def health():
